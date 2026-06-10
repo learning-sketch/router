@@ -358,6 +358,12 @@ class RequestResult:
     error: Optional[str] = None
 
 
+def _endpoint(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).path or url
+
+
 async def _post_json(session, url: str, payload: dict, headers: dict, timeout: float) -> dict:
     import aiohttp
 
@@ -366,7 +372,7 @@ async def _post_json(session, url: str, payload: dict, headers: dict, timeout: f
     ) as resp:
         text = await resp.text()
         if resp.status != 200:
-            raise RuntimeError(f"HTTP {resp.status}: {text[:500]}")
+            raise RuntimeError(f"{_endpoint(url)} -> HTTP {resp.status}: {text[:500]}")
         return json.loads(text)
 
 
@@ -379,7 +385,7 @@ async def _stream_post(session, url: str, payload: dict, headers: dict, timeout:
     ) as resp:
         if resp.status != 200:
             body = await resp.text()
-            raise RuntimeError(f"HTTP {resp.status}: {body[:500]}")
+            raise RuntimeError(f"{_endpoint(url)} -> HTTP {resp.status}: {body[:500]}")
         async for raw in resp.content:
             line = raw.decode("utf-8", "ignore").strip()
             if not line or not line.startswith("data:"):
@@ -689,14 +695,13 @@ def _classify_error(err: str) -> str:
         return "timeout"
     if "connect" in low or "connection" in low or "refused" in low or "reset" in low:
         return "connection error"
-    m = re.search(r"http (\d{3})", low)
-    if m:
-        # keep a short tail of the server message for HTTP errors
-        tail = err.split(":", 1)[1].strip() if ":" in err else ""
-        return f"HTTP {m.group(1)}: {tail[:160]}"
+    # Errors from the HTTP helpers look like "<path> -> HTTP <code>: <message>".
+    # Keep the endpoint path + code + a short tail so the failing call is obvious.
+    if "http " in low or "-> http" in low:
+        return err[:200]
     if "token_ids" in low or "keyerror" in low or "'choices'" in low:
-        return f"response parsing: {err[:160]}"
-    return err[:160]
+        return f"response parsing: {err[:180]}"
+    return err[:200]
 
 
 def _pct(values: List[float], p: float) -> float:
