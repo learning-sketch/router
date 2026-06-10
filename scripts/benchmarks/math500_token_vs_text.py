@@ -391,18 +391,44 @@ class Benchmark:
                 tok_name, trust_remote_code=True
             )
 
-    # ---- text scenario ---------------------------------------------------- #
-    async def run_text(self, session, index: int, record: Dict[str, Any]) -> RequestResult:
-        messages = build_messages(record["problem"], self.args.system_prompt)
-        url = f"{self.base_url}/v1/chat/completions"
-        base_payload = {
+    def _sampling_payload(self) -> Dict[str, Any]:
+        payload = {
             "model": self.args.model,
-            "messages": messages,
             "max_tokens": self.args.max_tokens,
             "temperature": self.args.temperature,
             "top_p": self.args.top_p,
             "seed": self.args.seed,
         }
+        if self.args.ignore_eos:
+            payload["ignore_eos"] = True
+            payload["min_tokens"] = self.args.max_tokens
+        return payload
+
+    # ---- text scenario ---------------------------------------------------- #
+    async def run_text(self, session, index: int, record: Dict[str, Any]) -> RequestResult:
+        base_payload = self._sampling_payload()
+        if self.args.use_chat_template:
+            url = f"{self.base_url}/v1/chat/completions"
+            base_payload["messages"] = build_messages(
+                record["problem"], self.args.system_prompt
+            )
+
+            def piece_stream(ch):
+                return (ch.get("delta") or {}).get("content")
+
+            def piece_full(ch):
+                return ch.get("message", {}).get("content") or ""
+        else:
+            # pure-performance path: raw prompt, no chat template
+            url = f"{self.base_url}/v1/completions"
+            base_payload["prompt"] = record["problem"]
+
+            def piece_stream(ch):
+                return ch.get("text")
+
+            def piece_full(ch):
+                return ch.get("text") or ""
+
         try:
             if self.args.stream:
                 payload = {**base_payload, "stream": True,
@@ -416,7 +442,7 @@ class Benchmark:
                 ):
                     choices = chunk.get("choices") or []
                     if choices:
-                        piece = (choices[0].get("delta") or {}).get("content")
+                        piece = piece_stream(choices[0])
                         if piece:
                             if t_first is None:
                                 t_first = now
@@ -437,7 +463,7 @@ class Benchmark:
                 )
                 gen_latency = time.perf_counter() - t0
                 choice = resp["choices"][0]
-                text = choice.get("message", {}).get("content") or ""
+                text = piece_full(choice)
                 usage = resp.get("usage", {}) or {}
                 completion_tokens = int(usage.get("completion_tokens", 0))
                 prompt_tokens = int(usage.get("prompt_tokens", 0))
@@ -464,18 +490,25 @@ class Benchmark:
         return ttft, tpot
 
     # ---- token scenario --------------------------------------------------- #
-    async def _tokenize(self, session, messages: List[Dict[str, str]]) -> Tuple[List[int], float]:
+    async def _tokenize(self, session, record: Dict[str, Any]) -> Tuple[List[int], float]:
         if self._local_tokenizer is not None:
             t0 = time.perf_counter()
-            ids = self._local_tokenizer.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=True
-            )
+            if self.args.use_chat_template:
+                ids = self._local_tokenizer.apply_chat_template(
+                    build_messages(record["problem"], self.args.system_prompt),
+                    add_generation_prompt=True, tokenize=True,
+                )
+            else:
+                ids = self._local_tokenizer.encode(record["problem"])
             return list(ids), time.perf_counter() - t0
-        payload = {
-            "model": self.args.model,
-            "messages": messages,
-            "add_generation_prompt": True,
-        }
+        if self.args.use_chat_template:
+            payload = {
+                "model": self.args.model,
+                "messages": build_messages(record["problem"], self.args.system_prompt),
+                "add_generation_prompt": True,
+            }
+        else:
+            payload = {"model": self.args.model, "prompt": record["problem"]}
         t0 = time.perf_counter()
         resp = await _post_json(
             session, f"{self.base_url}/tokenize", payload, self.headers,
@@ -497,19 +530,12 @@ class Benchmark:
         return resp.get("prompt", ""), time.perf_counter() - t0
 
     async def run_token(self, session, index: int, record: Dict[str, Any]) -> RequestResult:
-        messages = build_messages(record["problem"], self.args.system_prompt)
         url = f"{self.base_url}/v1/completions"
         try:
-            prompt_ids, tok_lat = await self._tokenize(session, messages)
-            base_payload = {
-                "model": self.args.model,
-                "prompt": prompt_ids,
-                "max_tokens": self.args.max_tokens,
-                "temperature": self.args.temperature,
-                "top_p": self.args.top_p,
-                "seed": self.args.seed,
-                "return_token_ids": True,
-            }
+            prompt_ids, tok_lat = await self._tokenize(session, record)
+            base_payload = {**self._sampling_payload(),
+                            "prompt": prompt_ids,
+                            "return_token_ids": True}
             ttft = tpot = None
             if self.args.stream:
                 payload = {**base_payload, "stream": True,
@@ -804,6 +830,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
+    p.add_argument("--ignore-eos", action="store_true",
+                   help="Force every request to generate exactly --max-tokens "
+                        "tokens (sets ignore_eos + min_tokens). Use for clean "
+                        "performance comparisons so both scenarios emit the same "
+                        "number of tokens. Makes accuracy meaningless.")
+    p.add_argument("--no-chat-template", dest="use_chat_template",
+                   action="store_false",
+                   help="Do NOT apply the chat template. Send the raw problem text "
+                        "(text scenario -> /v1/completions) or its raw token ids "
+                        "(token scenario). Recommended for pure performance testing; "
+                        "for accuracy on an instruct model keep the template ON.")
 
     # execution
     p.add_argument("--stream", action="store_true",

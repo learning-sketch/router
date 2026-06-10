@@ -92,6 +92,14 @@ python scripts/benchmarks/math500_token_vs_text.py \
 - `--stream`           Use streaming (SSE) requests and additionally report
   **TTFT** (time to first token) and **TPOT** (time per output token). Without it,
   only end-to-end generation latency is measured.
+- `--ignore-eos`       Force every request to emit exactly `--max-tokens` tokens
+  (sets `ignore_eos` + `min_tokens`). Use for **pure performance** runs so both
+  scenarios generate the same number of tokens (removes output-length as a
+  confound). Makes accuracy meaningless.
+- `--no-chat-template` Do **not** apply the chat template: send the raw problem
+  text (text scenario via `/v1/completions`) or its raw token ids (token
+  scenario). Recommended for pure performance testing; keep the template **on**
+  for accuracy on instruct models.
 - `--local-tokenizer` Tokenize/detokenize with `transformers` locally instead of
   the server `/tokenize` & `/detokenize` endpoints.
 - `--no-sympy`        Disable the sympy equivalence fallback (string match only).
@@ -117,6 +125,34 @@ For each scenario:
 
 It also prints a `token vs text` comparison: accuracy delta (percentage points),
 generation-latency speedup, and throughput ratio.
+
+## Two modes: accuracy vs pure performance
+
+| Goal | Recommended flags |
+|------|-------------------|
+| **Accuracy** comparison | chat template ON (default), natural stopping, `--temperature 0.0`, run the full 500 |
+| **Pure performance** comparison | `--no-chat-template --ignore-eos --stream --max-tokens <N>` |
+
+For pure performance the prompt content is irrelevant — what matters is the
+input/output token counts. `--ignore-eos` pins the output length to `--max-tokens`
+so the `text` and `token` scenarios generate the same number of tokens, which is
+required for a fair latency / throughput / TPOT comparison. The chat template is
+unnecessary in this mode, so `--no-chat-template` sends raw text vs raw token ids
+through `/v1/completions` for both scenarios — the cleanest apples-to-apples
+isolation of server-side (de)tokenization overhead.
+
+Pure-performance example:
+
+```bash
+python scripts/benchmarks/math500_token_vs_text.py \
+    --base-url http://127.0.0.1:8090 \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --num-samples 200 \
+    --concurrency 32 \
+    --no-chat-template --ignore-eos --stream \
+    --max-tokens 1024 \
+    --scenarios text token
+```
 
 ## Notes
 
