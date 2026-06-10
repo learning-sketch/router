@@ -8,6 +8,7 @@
 
 pub mod circuit_breaker;
 pub mod error;
+pub mod http_client;
 pub mod retry;
 pub mod token_bucket;
 pub mod worker;
@@ -18,6 +19,7 @@ pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerStats, CircuitState,
 };
 pub use error::{WorkerError, WorkerResult};
+pub use http_client::{build_client, default_client};
 pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecutor};
 pub use worker::{
     start_health_checker, BasicWorker, ConnectionMode, DPAwareWorker, HealthChecker, HealthConfig,

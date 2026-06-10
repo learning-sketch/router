@@ -38,10 +38,10 @@ impl OpenAIRouter {
         base_url: String,
         circuit_breaker_config: Option<CircuitBreakerConfig>,
     ) -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let client = crate::core::http_client::build_client(|builder| {
+            builder.timeout(std::time::Duration::from_secs(300))
+        })
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         let base_url = base_url.trim_end_matches('/').to_string();
 

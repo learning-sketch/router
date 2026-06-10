@@ -246,6 +246,28 @@ vllm-router \
 
 ### Troubleshooting
 
+**`Failed to create HTTP client: ... No CA certificates were found from the system`:**
+
+reqwest's default TLS backend loads the operating system CA trust store when the
+HTTP client is built. On minimal hosts/containers without a system trust store
+(no `ca-certificates` package) this used to prevent the router from starting,
+even though it usually talks to workers over plain HTTP.
+
+The router now automatically falls back to a bundled set of Mozilla root
+certificates, so it starts regardless. If you still want to use the system trust
+store (e.g. to trust an internal/private CA), install the certificates package:
+
+```bash
+# Debian/Ubuntu
+apt-get update && apt-get install -y ca-certificates && update-ca-certificates
+
+# RHEL/CentOS/Fedora
+dnf install -y ca-certificates && update-ca-trust
+
+# Alpine
+apk add --no-cache ca-certificates && update-ca-certificates
+```
+
 **VSCode Rust Analyzer Issues:**
 Set `rust-analyzer.linkedProjects` to the absolute path of `Cargo.toml`:
 

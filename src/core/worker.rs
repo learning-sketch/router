@@ -9,10 +9,10 @@ use std::sync::{Arc, LazyLock};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30)) // Default timeout, overridden per request
-        .build()
-        .expect("Failed to create worker HTTP client")
+    crate::core::http_client::build_client(|builder| {
+        builder.timeout(std::time::Duration::from_secs(30)) // Default timeout, overridden per request
+    })
+    .expect("Failed to create worker HTTP client")
 });
 
 /// Core worker abstraction that represents a backend service

@@ -4860,6 +4860,7 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+ "webpki-root-certs",
  "zmq",
 ]
 
