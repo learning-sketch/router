@@ -50,6 +50,18 @@ python scripts/benchmarks/math500_token_vs_text.py \
     --output math500_results.json
 ```
 
+Measure TTFT / TPOT (streaming):
+
+```bash
+python scripts/benchmarks/math500_token_vs_text.py \
+    --base-url http://127.0.0.1:8090 \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --num-samples 100 \
+    --concurrency 16 \
+    --stream \
+    --scenarios text token
+```
+
 Run only one scenario:
 
 ```bash
@@ -77,6 +89,9 @@ python scripts/benchmarks/math500_token_vs_text.py \
 - `--num-samples`     Limit number of problems (default: all 500).
 - `--concurrency`     Max in-flight requests (drives the throughput number).
 - `--max-tokens` / `--temperature` / `--top-p` / `--seed`  Sampling params.
+- `--stream`           Use streaming (SSE) requests and additionally report
+  **TTFT** (time to first token) and **TPOT** (time per output token). Without it,
+  only end-to-end generation latency is measured.
 - `--local-tokenizer` Tokenize/detokenize with `transformers` locally instead of
   the server `/tokenize` & `/detokenize` endpoints.
 - `--no-sympy`        Disable the sympy equivalence fallback (string match only).
@@ -92,6 +107,9 @@ For each scenario:
 - **Wall time / Requests-per-second** — end-to-end throughput at the chosen
   concurrency.
 - **Generation latency** — mean / median / p90 / p99 of the core generation call.
+- **TTFT** (with `--stream`) — time to first token: mean / median / p90 / p99 (ms).
+- **TPOT** (with `--stream`) — time per output token (mean inter-token latency
+  during decode, excluding the first token): mean / median / p90 (ms/tok).
 - **Output throughput** — completion tokens per second.
 - **Mean output tokens** — average completion length.
 - **Tokenize / Detokenize overhead** — extra client-side cost in the token

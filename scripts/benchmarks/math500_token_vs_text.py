@@ -328,6 +328,8 @@ class RequestResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     token_ids_returned: bool = False
+    ttft_s: Optional[float] = None    # time to first token (streaming only)
+    tpot_s: Optional[float] = None    # mean time per output token, excl. first (streaming only)
     prediction: Optional[str] = None
     error: Optional[str] = None
 
@@ -342,6 +344,30 @@ async def _post_json(session, url: str, payload: dict, headers: dict, timeout: f
         if resp.status != 200:
             raise RuntimeError(f"HTTP {resp.status}: {text[:500]}")
         return json.loads(text)
+
+
+async def _stream_post(session, url: str, payload: dict, headers: dict, timeout: float):
+    """Yield (arrival_time, parsed_chunk) for each SSE `data:` line of a stream."""
+    import aiohttp
+
+    async with session.post(
+        url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+    ) as resp:
+        if resp.status != 200:
+            body = await resp.text()
+            raise RuntimeError(f"HTTP {resp.status}: {body[:500]}")
+        async for raw in resp.content:
+            line = raw.decode("utf-8", "ignore").strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[len("data:"):].strip()
+            if data == "[DONE]":
+                break
+            now = time.perf_counter()
+            try:
+                yield now, json.loads(data)
+            except json.JSONDecodeError:
+                continue
 
 
 # --------------------------------------------------------------------------- #
@@ -368,35 +394,74 @@ class Benchmark:
     # ---- text scenario ---------------------------------------------------- #
     async def run_text(self, session, index: int, record: Dict[str, Any]) -> RequestResult:
         messages = build_messages(record["problem"], self.args.system_prompt)
-        payload = {
+        url = f"{self.base_url}/v1/chat/completions"
+        base_payload = {
             "model": self.args.model,
             "messages": messages,
             "max_tokens": self.args.max_tokens,
             "temperature": self.args.temperature,
             "top_p": self.args.top_p,
             "seed": self.args.seed,
-            "stream": False,
         }
         try:
-            t0 = time.perf_counter()
-            resp = await _post_json(
-                session, f"{self.base_url}/v1/chat/completions", payload,
-                self.headers, self.args.request_timeout,
-            )
-            gen_latency = time.perf_counter() - t0
-            choice = resp["choices"][0]
-            text = choice.get("message", {}).get("content") or ""
-            usage = resp.get("usage", {}) or {}
+            if self.args.stream:
+                payload = {**base_payload, "stream": True,
+                           "stream_options": {"include_usage": True}}
+                t0 = time.perf_counter()
+                text_parts: List[str] = []
+                t_first = t_last = None
+                completion_tokens = prompt_tokens = 0
+                async for now, chunk in _stream_post(
+                    session, url, payload, self.headers, self.args.request_timeout
+                ):
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        piece = (choices[0].get("delta") or {}).get("content")
+                        if piece:
+                            if t_first is None:
+                                t_first = now
+                            t_last = now
+                            text_parts.append(piece)
+                    usage = chunk.get("usage")
+                    if usage:
+                        completion_tokens = int(usage.get("completion_tokens") or completion_tokens)
+                        prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens)
+                gen_latency = time.perf_counter() - t0
+                text = "".join(text_parts)
+                ttft, tpot = self._ttft_tpot(t0, t_first, t_last, completion_tokens or len(text_parts))
+            else:
+                payload = {**base_payload, "stream": False}
+                t0 = time.perf_counter()
+                resp = await _post_json(
+                    session, url, payload, self.headers, self.args.request_timeout
+                )
+                gen_latency = time.perf_counter() - t0
+                choice = resp["choices"][0]
+                text = choice.get("message", {}).get("content") or ""
+                usage = resp.get("usage", {}) or {}
+                completion_tokens = int(usage.get("completion_tokens", 0))
+                prompt_tokens = int(usage.get("prompt_tokens", 0))
+                ttft = tpot = None
+
             res = RequestResult(
                 index=index, scenario="text", ok=True, gen_latency=gen_latency,
-                prompt_tokens=int(usage.get("prompt_tokens", 0)),
-                completion_tokens=int(usage.get("completion_tokens", 0)),
-                prediction=text,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                ttft_s=ttft, tpot_s=tpot, prediction=text,
             )
             res.correct = grade(text, record["answer"], self.args.use_sympy)
             return res
         except Exception as e:  # noqa: BLE001
             return RequestResult(index=index, scenario="text", ok=False, error=str(e))
+
+    @staticmethod
+    def _ttft_tpot(t0, t_first, t_last, n_tokens):
+        if t_first is None:
+            return None, None
+        ttft = t_first - t0
+        tpot = None
+        if t_last is not None and n_tokens and n_tokens > 1:
+            tpot = (t_last - t_first) / (n_tokens - 1)
+        return ttft, tpot
 
     # ---- token scenario --------------------------------------------------- #
     async def _tokenize(self, session, messages: List[Dict[str, str]]) -> Tuple[List[int], float]:
@@ -433,45 +498,84 @@ class Benchmark:
 
     async def run_token(self, session, index: int, record: Dict[str, Any]) -> RequestResult:
         messages = build_messages(record["problem"], self.args.system_prompt)
+        url = f"{self.base_url}/v1/completions"
         try:
             prompt_ids, tok_lat = await self._tokenize(session, messages)
-            payload = {
+            base_payload = {
                 "model": self.args.model,
                 "prompt": prompt_ids,
                 "max_tokens": self.args.max_tokens,
                 "temperature": self.args.temperature,
                 "top_p": self.args.top_p,
                 "seed": self.args.seed,
-                "stream": False,
                 "return_token_ids": True,
             }
-            t0 = time.perf_counter()
-            resp = await _post_json(
-                session, f"{self.base_url}/v1/completions", payload,
-                self.headers, self.args.request_timeout,
-            )
-            gen_latency = time.perf_counter() - t0
-            choice = resp["choices"][0]
-            usage = resp.get("usage", {}) or {}
+            ttft = tpot = None
+            if self.args.stream:
+                payload = {**base_payload, "stream": True,
+                           "stream_options": {"include_usage": True}}
+                t0 = time.perf_counter()
+                out_token_ids: List[int] = []
+                text_parts: List[str] = []
+                t_first = t_last = None
+                completion_tokens = prompt_tokens = 0
+                async for now, chunk in _stream_post(
+                    session, url, payload, self.headers, self.args.request_timeout
+                ):
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        delta_ids = choices[0].get("token_ids")
+                        piece = choices[0].get("text")
+                        produced = bool(delta_ids) or bool(piece)
+                        if produced:
+                            if t_first is None:
+                                t_first = now
+                            t_last = now
+                        if delta_ids:
+                            out_token_ids.extend(delta_ids)
+                        if piece:
+                            text_parts.append(piece)
+                    usage = chunk.get("usage")
+                    if usage:
+                        completion_tokens = int(usage.get("completion_tokens") or completion_tokens)
+                        prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens)
+                gen_latency = time.perf_counter() - t0
 
-            out_token_ids = choice.get("token_ids")
-            detok_lat = 0.0
-            token_ids_returned = bool(out_token_ids)
-            if token_ids_returned:
-                text, detok_lat = await self._detokenize(session, out_token_ids)
+                token_ids_returned = bool(out_token_ids)
+                detok_lat = 0.0
+                if token_ids_returned:
+                    text, detok_lat = await self._detokenize(session, out_token_ids)
+                else:
+                    text = "".join(text_parts)
+                n_out = completion_tokens or len(out_token_ids) or len(text_parts)
+                ttft, tpot = self._ttft_tpot(t0, t_first, t_last, n_out)
+                completion_tokens = completion_tokens or len(out_token_ids)
+                prompt_tokens = prompt_tokens or len(prompt_ids)
             else:
-                # return_token_ids unsupported -> fall back to the text field
-                text = choice.get("text") or ""
+                payload = {**base_payload, "stream": False}
+                t0 = time.perf_counter()
+                resp = await _post_json(
+                    session, url, payload, self.headers, self.args.request_timeout
+                )
+                gen_latency = time.perf_counter() - t0
+                choice = resp["choices"][0]
+                usage = resp.get("usage", {}) or {}
+                out_token_ids = choice.get("token_ids")
+                detok_lat = 0.0
+                token_ids_returned = bool(out_token_ids)
+                if token_ids_returned:
+                    text, detok_lat = await self._detokenize(session, out_token_ids)
+                else:
+                    text = choice.get("text") or ""
+                completion_tokens = int(usage.get("completion_tokens", len(out_token_ids or [])))
+                prompt_tokens = int(usage.get("prompt_tokens", len(prompt_ids)))
 
             res = RequestResult(
                 index=index, scenario="token", ok=True, gen_latency=gen_latency,
                 tokenize_latency=tok_lat, detokenize_latency=detok_lat,
-                prompt_tokens=int(usage.get("prompt_tokens", len(prompt_ids))),
-                completion_tokens=int(
-                    usage.get("completion_tokens", len(out_token_ids or []))
-                ),
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                 token_ids_returned=token_ids_returned,
-                prediction=text,
+                ttft_s=ttft, tpot_s=tpot, prediction=text,
             )
             res.correct = grade(text, record["answer"], self.args.use_sympy)
             return res
@@ -554,6 +658,8 @@ def summarize(scenario: str, results: List[RequestResult], wall_time: float) -> 
     tok_lat = [r.tokenize_latency for r in ok if r.tokenize_latency > 0]
     detok_lat = [r.detokenize_latency for r in ok if r.detokenize_latency > 0]
     token_ids_returned = sum(1 for r in ok if r.token_ids_returned)
+    ttfts = [r.ttft_s for r in ok if r.ttft_s is not None]
+    tpots = [r.tpot_s for r in ok if r.tpot_s is not None]
 
     from collections import Counter
 
@@ -581,6 +687,17 @@ def summarize(scenario: str, results: List[RequestResult], wall_time: float) -> 
         "tokenize_latency_mean_ms": (statistics.mean(tok_lat) * 1000) if tok_lat else 0.0,
         "detokenize_latency_mean_ms": (statistics.mean(detok_lat) * 1000) if detok_lat else 0.0,
         "token_ids_returned": token_ids_returned,
+        "has_streaming_metrics": bool(ttfts),
+        "ttft_mean_ms": (statistics.mean(ttfts) * 1000) if ttfts else 0.0,
+        "ttft_median_ms": (statistics.median(ttfts) * 1000) if ttfts else 0.0,
+        "ttft_p90_ms": _pct(ttfts, 90) * 1000,
+        "ttft_p99_ms": _pct(ttfts, 99) * 1000,
+        "tpot_mean_ms": (statistics.mean(tpots) * 1000) if tpots else 0.0,
+        "tpot_median_ms": (statistics.median(tpots) * 1000) if tpots else 0.0,
+        "tpot_p90_ms": _pct(tpots, 90) * 1000,
+        "decode_throughput_tok_per_s_per_req": (
+            1000.0 / (statistics.mean(tpots) * 1000) if tpots else 0.0
+        ),
     }
 
 
@@ -595,12 +712,22 @@ def print_report(summaries: Dict[str, Dict[str, Any]]) -> None:
         ("Gen latency median (s)", "gen_latency_median_s", "{:.3f}"),
         ("Gen latency p90 (s)", "gen_latency_p90_s", "{:.3f}"),
         ("Gen latency p99 (s)", "gen_latency_p99_s", "{:.3f}"),
+        ("TTFT mean (ms)", "ttft_mean_ms", "{:.1f}"),
+        ("TTFT median (ms)", "ttft_median_ms", "{:.1f}"),
+        ("TTFT p90 (ms)", "ttft_p90_ms", "{:.1f}"),
+        ("TTFT p99 (ms)", "ttft_p99_ms", "{:.1f}"),
+        ("TPOT mean (ms/tok)", "tpot_mean_ms", "{:.2f}"),
+        ("TPOT median (ms/tok)", "tpot_median_ms", "{:.2f}"),
+        ("TPOT p90 (ms/tok)", "tpot_p90_ms", "{:.2f}"),
         ("Mean output tokens", "mean_completion_tokens", "{:.1f}"),
         ("Output throughput (tok/s)", "output_throughput_tok_per_s", "{:.1f}"),
         ("Tokenize overhead (ms)", "tokenize_latency_mean_ms", "{:.2f}"),
         ("Detokenize overhead (ms)", "detokenize_latency_mean_ms", "{:.2f}"),
     ]
     scenarios = list(summaries.keys())
+    streaming = any(summaries[s].get("has_streaming_metrics") for s in scenarios)
+    if not streaming:
+        rows = [r for r in rows if not (r[0].startswith("TTFT") or r[0].startswith("TPOT"))]
     col_w = 28
     header = "Metric".ljust(col_w) + "".join(s.ljust(16) for s in scenarios)
     print("\n" + "=" * len(header))
@@ -679,6 +806,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--system-prompt", default=DEFAULT_SYSTEM_PROMPT)
 
     # execution
+    p.add_argument("--stream", action="store_true",
+                   help="Use streaming (SSE) requests and measure TTFT and TPOT. "
+                        "Without this flag, only end-to-end generation latency is reported.")
     p.add_argument("--concurrency", type=int, default=8,
                    help="Max in-flight requests.")
     p.add_argument("--request-timeout", type=float, default=600.0,
@@ -756,6 +886,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 f"  throughput ratio (token/text): "
                 f"{k['output_throughput_tok_per_s'] / t['output_throughput_tok_per_s']:.3f}x"
             )
+        if t.get("has_streaming_metrics") and k.get("has_streaming_metrics"):
+            if t["ttft_mean_ms"]:
+                print(
+                    f"  TTFT delta (token-text): "
+                    f"{k['ttft_mean_ms'] - t['ttft_mean_ms']:+.1f} ms "
+                    f"(text {t['ttft_mean_ms']:.1f} -> token {k['ttft_mean_ms']:.1f})"
+                )
+            if t["tpot_mean_ms"]:
+                print(
+                    f"  TPOT delta (token-text): "
+                    f"{k['tpot_mean_ms'] - t['tpot_mean_ms']:+.3f} ms/tok "
+                    f"(text {t['tpot_mean_ms']:.3f} -> token {k['tpot_mean_ms']:.3f})"
+                )
         print()
 
     if args.output:
