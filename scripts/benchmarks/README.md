@@ -45,6 +45,39 @@ pip install sympy antlr4-python3-runtime
 pip install transformers
 ```
 
+## Prepare the dataset offline (recommended behind a proxy)
+
+Download MATH-500 once to a local JSONL and run with `--data-file` so the
+benchmark never touches the network at runtime. The Hub file already has the
+expected `problem` / `answer` fields:
+
+```bash
+# direct
+curl -L "https://huggingface.co/datasets/HuggingFaceH4/MATH-500/resolve/main/test.jsonl" \
+     -o math500_test.jsonl
+
+# or via mirror (e.g. behind a restrictive proxy)
+curl -L "https://hf-mirror.com/datasets/HuggingFaceH4/MATH-500/resolve/main/test.jsonl" \
+     -o math500_test.jsonl
+
+# or export through the datasets library
+python3 -c "from datasets import load_dataset; \
+load_dataset('HuggingFaceH4/MATH-500', split='test').to_json('math500_test.jsonl')"
+```
+
+Then point the benchmark at it:
+
+```bash
+python scripts/benchmarks/math500_token_vs_text.py \
+    --base-url http://127.0.0.1:8000 --model "Qwen/Qwen3-8B" \
+    --data-file math500_test.jsonl --scenarios text token
+```
+
+> Proxy note: a transparent/system proxy can intercept `/v1/completions` and
+> route it to a different OpenAI-compatible backend, causing intermittent
+> `The model ... does not exist` (404) errors. Make sure the vLLM host bypasses
+> the proxy, e.g. `export NO_PROXY=localhost,127.0.0.1,<vllm-host>`.
+
 ## Usage
 
 Point it at a running vLLM server or the vLLM Router:
