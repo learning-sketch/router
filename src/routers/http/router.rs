@@ -256,10 +256,10 @@ impl Router {
         );
 
         let start_time = std::time::Instant::now();
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let client = crate::core::http_client::build_client(|builder| {
+            builder.timeout(Duration::from_secs(2))
+        })
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         loop {
             if start_time.elapsed() > Duration::from_secs(worker_startup_timeout_secs) {
@@ -1006,10 +1006,10 @@ impl Router {
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
         let start_time = std::time::Instant::now();
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.worker_startup_timeout_secs))
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        let client = crate::core::http_client::build_client(|builder| {
+            builder.timeout(Duration::from_secs(self.worker_startup_timeout_secs))
+        })
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
         loop {
             if start_time.elapsed() > Duration::from_secs(self.worker_startup_timeout_secs) {

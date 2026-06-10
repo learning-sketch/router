@@ -14,7 +14,7 @@ impl SingleServerRoute {
         Self {
             host: host.to_string(),
             port,
-            client: reqwest::Client::new(),
+            client: crate::core::http_client::default_client(),
         }
     }
 }
