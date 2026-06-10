@@ -4,10 +4,21 @@
 vLLM Router in front of it) on the **MATH-500** dataset under two scenarios, and
 reports **accuracy** and **performance** side by side:
 
+**Both scenarios hit the same endpoint, `POST /v1/completions`**, so the *only*
+difference is the input/output representation:
+
 | Scenario | 中文 | Endpoint | Input | Output |
 |----------|------|----------|-------|--------|
-| `text`   | 输入 prompt / 输出 prompt | `POST /v1/chat/completions` | text `messages` | text `content` |
-| `token`  | 输入 token id / 输出 token id | `POST /v1/completions` | `prompt` = list of token ids | `token_ids` (via `return_token_ids`) |
+| `text`   | 输入 prompt / 输出 prompt | `POST /v1/completions` | `prompt` = **string** | text |
+| `token`  | 输入 token id / 输出 token id | `POST /v1/completions` | `prompt` = **list of token ids** | `token_ids` (via `return_token_ids`) |
+
+To keep the two scenarios comparing the exact same prompt, the prompt is built
+once as token ids (chat template applied, or raw, or random). The `token`
+scenario sends those ids directly; the `text` scenario sends the **string form**
+of the same prompt (rendered via `/detokenize`, with `add_special_tokens=false`
+since the ids already include any special tokens). In `--no-chat-template` mode
+the `text` prompt is simply the raw problem text and the `token` prompt is its
+tokenization.
 
 Both scenarios build the **same logical prompt** (the chat template is applied in
 both cases), so the only difference is whether text or token ids cross the wire
@@ -96,10 +107,15 @@ python scripts/benchmarks/math500_token_vs_text.py \
   (sets `ignore_eos` + `min_tokens`). Use for **pure performance** runs so both
   scenarios generate the same number of tokens (removes output-length as a
   confound). Makes accuracy meaningless.
-- `--no-chat-template` Do **not** apply the chat template: send the raw problem
-  text (text scenario via `/v1/completions`) or its raw token ids (token
-  scenario). Recommended for pure performance testing; keep the template **on**
-  for accuracy on instruct models.
+- `--no-chat-template` Do **not** apply the chat template: the text scenario
+  sends the raw problem text and the token scenario sends its raw token ids.
+  Recommended for pure performance testing; keep the template **on** for accuracy
+  on instruct models.
+- `--random-input`     Ignore the dataset entirely and send fixed-length
+  **random-token** prompts (no dataset/tokenizer needed). Pure throughput/latency
+  testing — accuracy is meaningless. Pair with `--ignore-eos`.
+- `--random-input-len` Prompt length in tokens for `--random-input` (default 1024).
+- `--random-vocab-size` Upper bound for random token ids (default 32000).
 - `--local-tokenizer` Tokenize/detokenize with `transformers` locally instead of
   the server `/tokenize` & `/detokenize` endpoints.
 - `--no-sympy`        Disable the sympy equivalence fallback (string match only).
@@ -151,6 +167,19 @@ python scripts/benchmarks/math500_token_vs_text.py \
     --concurrency 32 \
     --no-chat-template --ignore-eos --stream \
     --max-tokens 1024 \
+    --scenarios text token
+```
+
+Synthetic random-input throughput test (no dataset):
+
+```bash
+python scripts/benchmarks/math500_token_vs_text.py \
+    --base-url http://127.0.0.1:8090 \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --random-input --random-input-len 1024 \
+    --ignore-eos --max-tokens 512 \
+    --stream --concurrency 64 \
+    --num-samples 500 \
     --scenarios text token
 ```
 

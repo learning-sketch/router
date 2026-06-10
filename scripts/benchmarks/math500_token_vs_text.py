@@ -255,6 +255,30 @@ def grade(prediction_text: str, ground_truth: str, use_sympy: bool) -> bool:
 # Dataset loading
 # --------------------------------------------------------------------------- #
 
+def make_random_records(
+    num_prompts: int, input_len: int, vocab_size: int, seed: int
+) -> List[Dict[str, Any]]:
+    """Synthesize fixed-length random-token prompts for pure throughput testing.
+
+    Each record carries `prompt_token_ids`; no dataset / tokenizer is needed.
+    Accuracy is meaningless in this mode (answers are empty).
+    """
+    import random
+
+    rng = random.Random(seed)
+    low = 10  # avoid the very low ids which are often special tokens
+    high = max(low + 1, vocab_size)
+    records: List[Dict[str, Any]] = []
+    for _ in range(num_prompts):
+        ids = [rng.randrange(low, high) for _ in range(input_len)]
+        records.append({"problem": "", "answer": "", "prompt_token_ids": ids})
+    logger.info(
+        "Synthesized %d random prompts of %d tokens (vocab<%d)",
+        num_prompts, input_len, vocab_size,
+    )
+    return records
+
+
 def load_dataset_records(
     data_file: Optional[str],
     hf_name: str,
@@ -404,32 +428,39 @@ class Benchmark:
             payload["min_tokens"] = self.args.max_tokens
         return payload
 
-    # ---- text scenario ---------------------------------------------------- #
+    async def _build_text_prompt(self, session, record: Dict[str, Any]) -> Tuple[Any, bool]:
+        """Build the *string* prompt for the text scenario, derived from the SAME
+        prompt token ids the token scenario uses, so the two only differ in the
+        input representation (string vs token ids).
+
+        Returns (prompt_string, add_special_tokens). For the chat-template and
+        random-input cases we render the prompt token ids back to a string via
+        /detokenize and disable add_special_tokens (the ids already include any
+        special tokens). For the raw `--no-chat-template` case we send the raw
+        problem text and let the server add special tokens, matching how the
+        token scenario obtained its ids.
+        """
+        if self.args.use_chat_template or ("prompt_token_ids" in record):
+            prompt_ids, _ = await self._tokenize(session, record)
+            prompt_text, _ = await self._detokenize(session, prompt_ids)
+            return prompt_text, False
+        return record["problem"], True
+
+    # ---- text scenario (same endpoint as token: /v1/completions) ---------- #
     async def run_text(self, session, index: int, record: Dict[str, Any]) -> RequestResult:
+        url = f"{self.base_url}/v1/completions"
         base_payload = self._sampling_payload()
-        if self.args.use_chat_template:
-            url = f"{self.base_url}/v1/chat/completions"
-            base_payload["messages"] = build_messages(
-                record["problem"], self.args.system_prompt
-            )
 
-            def piece_stream(ch):
-                return (ch.get("delta") or {}).get("content")
+        def piece_stream(ch):
+            return ch.get("text")
 
-            def piece_full(ch):
-                return ch.get("message", {}).get("content") or ""
-        else:
-            # pure-performance path: raw prompt, no chat template
-            url = f"{self.base_url}/v1/completions"
-            base_payload["prompt"] = record["problem"]
-
-            def piece_stream(ch):
-                return ch.get("text")
-
-            def piece_full(ch):
-                return ch.get("text") or ""
+        def piece_full(ch):
+            return ch.get("text") or ""
 
         try:
+            prompt_text, add_special = await self._build_text_prompt(session, record)
+            base_payload["prompt"] = prompt_text
+            base_payload["add_special_tokens"] = add_special
             if self.args.stream:
                 payload = {**base_payload, "stream": True,
                            "stream_options": {"include_usage": True}}
@@ -491,6 +522,9 @@ class Benchmark:
 
     # ---- token scenario --------------------------------------------------- #
     async def _tokenize(self, session, record: Dict[str, Any]) -> Tuple[List[int], float]:
+        if "prompt_token_ids" in record:
+            # pre-supplied ids (e.g. synthetic --random-input)
+            return list(record["prompt_token_ids"]), 0.0
         if self._local_tokenizer is not None:
             t0 = time.perf_counter()
             if self.args.use_chat_template:
@@ -822,7 +856,18 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
                    help="Hugging Face dataset name (used when --data-file is unset).")
     p.add_argument("--split", default="test", help="Dataset split.")
     p.add_argument("--num-samples", type=int, default=None,
-                   help="Limit number of problems (default: all).")
+                   help="Limit number of problems (default: all). In --random-input "
+                        "mode this is the number of synthetic prompts (default 200).")
+
+    # synthetic input
+    p.add_argument("--random-input", action="store_true",
+                   help="Ignore the dataset and send fixed-length random-token "
+                        "prompts. Pure throughput/latency testing; accuracy is "
+                        "meaningless. Pair with --ignore-eos.")
+    p.add_argument("--random-input-len", type=int, default=1024,
+                   help="Prompt length (in tokens) for --random-input.")
+    p.add_argument("--random-vocab-size", type=int, default=32000,
+                   help="Upper bound for random token ids in --random-input.")
 
     # sampling
     p.add_argument("--max-tokens", type=int, default=2048)
@@ -880,9 +925,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         logger.error("aiohttp is required. Install with `pip install aiohttp`.")
         return 1
 
-    records = load_dataset_records(
-        args.data_file, args.hf_name, args.split, args.num_samples
-    )
+    if args.random_input:
+        n = args.num_samples if args.num_samples is not None else 200
+        records = make_random_records(
+            n, args.random_input_len, args.random_vocab_size, args.seed
+        )
+        if not args.ignore_eos:
+            logger.warning(
+                "--random-input without --ignore-eos: outputs will stop on random "
+                "EOS and lengths may vary. Add --ignore-eos for clean throughput numbers."
+            )
+    else:
+        records = load_dataset_records(
+            args.data_file, args.hf_name, args.split, args.num_samples
+        )
     if not records:
         logger.error("No problems loaded; aborting.")
         return 1
@@ -907,6 +963,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             ]
 
     print_report(summaries)
+
+    if args.random_input:
+        print("Note: --random-input mode -> accuracy numbers are meaningless "
+              "(synthetic prompts). Look at throughput / latency / TTFT / TPOT.\n")
 
     if "text" in summaries and "token" in summaries:
         t, k = summaries["text"], summaries["token"]
