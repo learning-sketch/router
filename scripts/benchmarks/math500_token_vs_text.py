@@ -516,6 +516,25 @@ class Benchmark:
 # Aggregation & reporting
 # --------------------------------------------------------------------------- #
 
+def _classify_error(err: str) -> str:
+    """Collapse error strings into a few buckets so failures are diagnosable."""
+    if not err:
+        return "unknown"
+    low = err.lower()
+    if "timeout" in low or "timed out" in low:
+        return "timeout"
+    if "connect" in low or "connection" in low or "refused" in low or "reset" in low:
+        return "connection error"
+    m = re.search(r"http (\d{3})", low)
+    if m:
+        # keep a short tail of the server message for HTTP errors
+        tail = err.split(":", 1)[1].strip() if ":" in err else ""
+        return f"HTTP {m.group(1)}: {tail[:160]}"
+    if "token_ids" in low or "keyerror" in low or "'choices'" in low:
+        return f"response parsing: {err[:160]}"
+    return err[:160]
+
+
 def _pct(values: List[float], p: float) -> float:
     if not values:
         return 0.0
@@ -536,7 +555,14 @@ def summarize(scenario: str, results: List[RequestResult], wall_time: float) -> 
     detok_lat = [r.detokenize_latency for r in ok if r.detokenize_latency > 0]
     token_ids_returned = sum(1 for r in ok if r.token_ids_returned)
 
+    from collections import Counter
+
+    error_counts = Counter(
+        _classify_error(r.error) for r in results if not r.ok and r.error
+    )
+
     return {
+        "errors": dict(error_counts.most_common()),
         "scenario": scenario,
         "total": total,
         "succeeded": n_ok,
@@ -599,7 +625,15 @@ def print_report(summaries: Dict[str, Dict[str, Any]]) -> None:
     for s in scenarios:
         summ = summaries[s]
         if summ.get("failed"):
-            print(f"  [warn] scenario '{s}' had {summ['failed']} failed request(s)")
+            print(f"  [warn] scenario '{s}' had {summ['failed']} failed request(s):")
+            for msg, cnt in summ.get("errors", {}).items():
+                print(f"           {cnt:>4}x  {msg}")
+            if summ["succeeded"] < max(1, summ["total"] // 2):
+                print(
+                    f"  [warn] scenario '{s}': accuracy is computed over only "
+                    f"{summ['succeeded']} successful sample(s) and is NOT reliable. "
+                    "Fix the failures above first."
+                )
         if s == "token" and summ.get("token_ids_returned", 0) < summ.get("succeeded", 0):
             print(
                 f"  [warn] scenario 'token': only {summ['token_ids_returned']}/"
